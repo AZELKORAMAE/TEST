@@ -5443,74 +5443,68 @@ class EmbeddedFileExtractor:
 
             self.log(f"  ✅ {len(filename_to_position)} position(s) OLE découverte(s)")
 
-            # ============================================================
-            # ÉTAPE 2 : OUVRIR AVEC OPENPYXL ET SUPPRIMER LES OLE
-            # ============================================================
             original_ext = original_path.suffix.lower()
-            wb = openpyxl.load_workbook(
-                str(original_path),
-                keep_vba=(original_ext == '.xlsm')
-            )
 
-            # Supprimer les objets OLE et le legacy drawing (icônes VML)
-            # de TOUTES les feuilles - openpyxl écrira un fichier propre.
-            for ws in wb.worksheets:
-                if hasattr(ws, '_oleObjects'):
-                    try:
-                        ws._oleObjects = []
-                    except Exception:
-                        pass
-                if hasattr(ws, 'legacy_drawing'):
-                    try:
-                        ws.legacy_drawing = None
-                    except Exception:
-                        pass
-
-            # ============================================================
-            # ÉTAPE 3 : INSÉRER "Voir [filename]" AUX POSITIONS DÉCOUVERTES
-            # ============================================================
-            self.log(f"\n  🔧 INSERTION DES TEXTES DE REMPLACEMENT...")
-            modifications_applied = 0
-
-            for item in extracted_files:
-                if item['action'] != 'replace':
-                    continue
-                filename = item.get('filename')
-                extracted_name = item.get('extracted_name', '')
-                if not filename:
-                    continue
-                if filename not in filename_to_position:
-                    self.log(f"    ⚠️ Position introuvable : {filename}")
-                    continue
-
-                sheet_idx, col, row = filename_to_position[filename]
-                if sheet_idx < 1 or sheet_idx > len(wb.worksheets):
-                    self.log(f"    ⚠️ Index de feuille invalide pour {filename}")
-                    continue
-
-                ws = wb.worksheets[sheet_idx - 1]
-                display = (Path(extracted_name).stem if extracted_name
-                           else Path(filename).stem)
-                cell = ws.cell(row=row, column=col)
-                cell.value = f"Voir {display}"
-                cell.font = Font(bold=True, color='FF0000', size=12)
-                self.log(f"    ✅ {ws.title}!{cell.coordinate} → Voir {display}")
-                modifications_applied += 1
-
-            # ============================================================
-            # ÉTAPE 4 : SAUVEGARDER (openpyxl écrit un fichier valide)
-            # ============================================================
-            wb.save(str(modified_path))
-
-            # ============================================================
-            # ÉTAPE 5 : XLSM uniquement — nettoyer les résidus OLE
-            # ============================================================
-            # En mode keep_vba=True, openpyxl conserve l'archive d'origine
-            # comme base et préserve toutes les parts "inconnues" (embeddings,
-            # VML d'icônes, ancres de drawing). On les retire en post-traitement.
             if original_ext == '.xlsm':
-                embed_names = list(filename_to_position.keys())
-                self._strip_xlsm_ole_residue(modified_path, embed_names)
+                # ============================================================
+                # XLSM : manipulation ZIP directe (préserve intégrité VBA)
+                # ============================================================
+                # openpyxl, même avec keep_vba=True, réécrit styles/formules
+                # et altère légèrement le fichier. Pour les classeurs avec
+                # macros, on conserve l'archive d'origine telle quelle et on
+                # ne touche QUE aux parts OLE + on insère le texte directement
+                # comme inline string dans le worksheet XML.
+                modifications_applied = self._modify_xlsm_via_zip(
+                    original_path, modified_path,
+                    extracted_files, filename_to_position
+                )
+            else:
+                # ============================================================
+                # XLSX : openpyxl (fichier propre, valide)
+                # ============================================================
+                wb = openpyxl.load_workbook(str(original_path))
+
+                for ws in wb.worksheets:
+                    if hasattr(ws, '_oleObjects'):
+                        try:
+                            ws._oleObjects = []
+                        except Exception:
+                            pass
+                    if hasattr(ws, 'legacy_drawing'):
+                        try:
+                            ws.legacy_drawing = None
+                        except Exception:
+                            pass
+
+                self.log(f"\n  🔧 INSERTION DES TEXTES DE REMPLACEMENT...")
+                modifications_applied = 0
+
+                for item in extracted_files:
+                    if item['action'] != 'replace':
+                        continue
+                    filename = item.get('filename')
+                    extracted_name = item.get('extracted_name', '')
+                    if not filename:
+                        continue
+                    if filename not in filename_to_position:
+                        self.log(f"    ⚠️ Position introuvable : {filename}")
+                        continue
+
+                    sheet_idx, col, row = filename_to_position[filename]
+                    if sheet_idx < 1 or sheet_idx > len(wb.worksheets):
+                        self.log(f"    ⚠️ Index de feuille invalide pour {filename}")
+                        continue
+
+                    ws = wb.worksheets[sheet_idx - 1]
+                    display = (Path(extracted_name).stem if extracted_name
+                               else Path(filename).stem)
+                    cell = ws.cell(row=row, column=col)
+                    cell.value = f"Voir {display}"
+                    cell.font = Font(bold=True, color='FF0000', size=12)
+                    self.log(f"    ✅ {ws.title}!{cell.coordinate} → Voir {display}")
+                    modifications_applied += 1
+
+                wb.save(str(modified_path))
 
             self.log(f"\n  ✅ Excel modifié : {modified_path.name}")
             self.log(f"  ✅ {modifications_applied} objet(s) OLE remplacé(s) par texte")
@@ -5526,189 +5520,333 @@ class EmbeddedFileExtractor:
             except Exception:
                 pass
 
-    def _strip_xlsm_ole_residue(self, xlsm_path, embed_filenames):
+    @staticmethod
+    def _col_letter(col):
+        """1 → 'A', 27 → 'AA'"""
+        letters = ''
+        n = col
+        while n > 0:
+            n, rem = divmod(n - 1, 26)
+            letters = chr(65 + rem) + letters
+        return letters
+
+    def _modify_xlsm_via_zip(self, original_path, modified_path,
+                             extracted_files, filename_to_position):
         """
-        Post-traitement XLSM : retire les vestiges OLE qu'openpyxl conserve
-        en mode keep_vba (embeddings, VML d'icônes, ancres oleObject, rels).
-        Préserve vbaProject.bin et tout le reste.
+        Modifie un XLSM par manipulation ZIP directe :
+        - Préserve l'archive d'origine VERBATIM (VBA, styles, formules, etc.)
+        - Retire UNIQUEMENT les parts OLE (oleObjects, legacyDrawing,
+          embeddings, VML d'icônes)
+        - Insère "Voir [filename]" comme inline string dans les cellules cibles
+          avec un style rouge gras 12pt ajouté à styles.xml
+        Retourne le nombre de modifications appliquées.
         """
-        try:
-            from lxml import etree as _et
+        from lxml import etree as _et
 
-            xlsm_path = Path(xlsm_path)
-            ns_rel = ('http://schemas.openxmlformats.org'
-                      '/package/2006/relationships')
-            ns_r = ('http://schemas.openxmlformats.org'
-                    '/officeDocument/2006/relationships')
-            ns_ct = ('http://schemas.openxmlformats.org'
-                     '/package/2006/content-types')
+        original_path = Path(original_path)
+        modified_path = Path(modified_path)
+        ns_rel = ('http://schemas.openxmlformats.org'
+                  '/package/2006/relationships')
+        ns_ct = ('http://schemas.openxmlformats.org'
+                 '/package/2006/content-types')
+        ns_main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+        ns_m = f'{{{ns_main}}}'
 
-            with tempfile.TemporaryDirectory() as td:
-                tp = Path(td)
-                with zipfile.ZipFile(xlsm_path, 'r') as zf:
-                    zf.extractall(tp)
+        modifications_applied = 0
 
-                deleted_parts = []   # PartName absolus pour Content_Types
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td)
+            with zipfile.ZipFile(original_path, 'r') as zf:
+                zf.extractall(tp)
 
-                # ── 1. Worksheets : retirer oleObjects + legacyDrawing ──
-                ws_dir = tp / 'xl' / 'worksheets'
-                if ws_dir.exists():
-                    for ws_file in ws_dir.glob('sheet*.xml'):
-                        try:
-                            tree = _et.parse(str(ws_file))
-                            root = tree.getroot()
-                            changed = False
+            # ── 1. Ajouter un style "rouge gras 12pt" à styles.xml ────
+            style_id = self._add_red_bold_style(tp / 'xl' / 'styles.xml',
+                                                ns_main)
 
-                            # Parcourir et supprimer <oleObjects>,
-                            # <legacyDrawing>, et tout <mc:AlternateContent>
-                            # contenant un oleObject.
-                            for parent in list(root.iter()):
-                                for child in list(parent):
-                                    local = (child.tag.split('}')[-1]
-                                             if '}' in child.tag
-                                             else child.tag)
-                                    if local in ('oleObjects',
-                                                 'legacyDrawing'):
+            # ── 2. Construire sheet_idx → [(col, row, text), ...] ─────
+            position_to_text = {}
+            for item in extracted_files:
+                if item['action'] != 'replace':
+                    continue
+                fn = item.get('filename')
+                ext = item.get('extracted_name', '')
+                if not fn or fn not in filename_to_position:
+                    if fn:
+                        self.log(f"    ⚠️ Position introuvable : {fn}")
+                    continue
+                sheet_idx, col, row = filename_to_position[fn]
+                display = (Path(ext).stem if ext
+                           else Path(fn).stem)
+                position_to_text.setdefault(sheet_idx, []).append(
+                    (col, row, f"Voir {display}"))
+
+            # ── 3. Pour chaque worksheet : retirer OLE + insérer texte ─
+            deleted_parts = []
+            vml_files_to_delete = set()
+            ws_dir = tp / 'xl' / 'worksheets'
+
+            if ws_dir.exists():
+                for ws_file in ws_dir.glob('sheet*.xml'):
+                    try:
+                        sheet_idx = int(ws_file.stem.replace('sheet', ''))
+                    except ValueError:
+                        continue
+
+                    try:
+                        tree = _et.parse(str(ws_file))
+                        root = tree.getroot()
+                        changed = False
+
+                        # Retirer oleObjects / legacyDrawing / AC[oleObject]
+                        for parent in list(root.iter()):
+                            for child in list(parent):
+                                local = (child.tag.split('}')[-1]
+                                         if '}' in child.tag
+                                         else child.tag)
+                                if local in ('oleObjects', 'legacyDrawing'):
+                                    parent.remove(child)
+                                    changed = True
+                                elif local == 'AlternateContent':
+                                    if any(
+                                        (d.tag.split('}')[-1]
+                                         if '}' in d.tag else d.tag)
+                                        == 'oleObject'
+                                        for d in child.iter()
+                                    ):
                                         parent.remove(child)
                                         changed = True
-                                    elif local == 'AlternateContent':
-                                        if any(
-                                            (d.tag.split('}')[-1]
-                                             if '}' in d.tag else d.tag)
-                                            == 'oleObject'
-                                            for d in child.iter()
-                                        ):
-                                            parent.remove(child)
-                                            changed = True
 
-                            if changed:
-                                tree.write(str(ws_file),
-                                           encoding='UTF-8',
-                                           xml_declaration=True)
-                                self.log(f"    🧹 OLE retiré de "
-                                         f"{ws_file.name}")
-                        except Exception as e:
-                            self.log(f"    ⚠️ {ws_file.name}: {e}")
+                        # Insérer le texte dans les cellules
+                        for (col, row, text) in position_to_text.get(
+                                sheet_idx, []):
+                            if self._set_inline_string(
+                                    root, ns_m, col, row, text, style_id):
+                                modifications_applied += 1
+                                changed = True
+                                self.log(f"    ✅ sheet{sheet_idx} "
+                                         f"{self._col_letter(col)}{row} "
+                                         f"→ {text}")
 
-                # ── 2. Sheet rels : retirer embeddings + vmlDrawing rels ──
-                rels_dir = ws_dir / '_rels' if ws_dir.exists() else None
-                vml_files_to_delete = set()
-                if rels_dir and rels_dir.exists():
-                    for rels_file in rels_dir.glob('sheet*.xml.rels'):
-                        try:
-                            tree = _et.parse(str(rels_file))
-                            root = tree.getroot()
-                            changed = False
-                            for rel in list(
-                                    root.findall(
-                                        f'{{{ns_rel}}}Relationship')):
-                                tgt = rel.get('Target', '')
-                                if ('embeddings/' in tgt
-                                        or 'vmlDrawing' in tgt.lower()):
-                                    if 'vmlDrawing' in tgt.lower():
-                                        # Résoudre le path VML
-                                        if tgt.startswith('../'):
-                                            vp = tp / 'xl' / tgt[3:]
-                                        elif tgt.startswith('/'):
-                                            vp = tp / tgt.lstrip('/')
-                                        else:
-                                            vp = ws_dir / tgt
-                                        vml_files_to_delete.add(
-                                            vp.resolve())
-                                    root.remove(rel)
-                                    changed = True
-                            if changed:
-                                tree.write(str(rels_file),
-                                           encoding='UTF-8',
-                                           xml_declaration=True)
-                        except Exception as e:
-                            self.log(f"    ⚠️ {rels_file.name}: {e}")
-
-                # ── 3. Supprimer les embeddings physiques ──
-                emb_dir = tp / 'xl' / 'embeddings'
-                if emb_dir.exists():
-                    for fn in embed_filenames:
-                        fp = emb_dir / fn
-                        if fp.exists():
-                            fp.unlink()
-                            deleted_parts.append('/xl/embeddings/' + fn)
-                            self.log(f"    🗑️ {fn} supprimé")
-                    # Supprimer tous les embeddings restants n'étant plus
-                    # référencés ? Non — on garde au cas où d'autres feuilles
-                    # les utilisent et que la position n'a pas été trouvée.
-
-                # ── 4. Supprimer les fichiers VML orphelins ──
-                for vp in vml_files_to_delete:
-                    try:
-                        if vp.exists():
-                            vp.unlink()
-                            rel = '/' + str(
-                                vp.relative_to(tp)
-                            ).replace('\\', '/')
-                            deleted_parts.append(rel)
-                            self.log(f"    🗑️ {vp.name} supprimé")
-                            # Supprimer le .rels associé (vml peut avoir
-                            # ses propres rels pour les images d'icônes)
-                            vml_rels = (vp.parent / '_rels'
-                                        / (vp.name + '.rels'))
-                            if vml_rels.exists():
-                                # Lire pour récupérer les images d'icônes
-                                try:
-                                    tt = _et.parse(str(vml_rels))
-                                    for rr in tt.getroot().findall(
-                                            f'{{{ns_rel}}}Relationship'):
-                                        t = rr.get('Target', '')
-                                        if t.startswith('../'):
-                                            ip = tp / 'xl' / t[3:]
-                                        else:
-                                            ip = vp.parent / t
-                                        ip = ip.resolve()
-                                        if ip.exists() and 'media' in str(ip):
-                                            ip.unlink()
-                                            rel2 = '/' + str(
-                                                ip.relative_to(tp)
-                                            ).replace('\\', '/')
-                                            deleted_parts.append(rel2)
-                                except Exception:
-                                    pass
-                                vml_rels.unlink()
-                    except Exception as e:
-                        self.log(f"    ⚠️ VML {vp}: {e}")
-
-                # ── 5. [Content_Types].xml : retirer les Override morts ──
-                ct_path = tp / '[Content_Types].xml'
-                if ct_path.exists() and deleted_parts:
-                    try:
-                        tree = _et.parse(str(ct_path))
-                        root = tree.getroot()
-                        removed = 0
-                        for ov in list(
-                                root.findall(f'{{{ns_ct}}}Override')):
-                            pn = ov.get('PartName', '')
-                            if pn in deleted_parts:
-                                root.remove(ov)
-                                removed += 1
-                        if removed:
-                            tree.write(str(ct_path),
+                        if changed:
+                            tree.write(str(ws_file),
                                        encoding='UTF-8',
                                        xml_declaration=True)
-                            self.log(f"    🧹 {removed} entrée(s) "
-                                     f"Content-Types retirée(s)")
                     except Exception as e:
-                        self.log(f"    ⚠️ Content-Types: {e}")
+                        self.log(f"    ⚠️ {ws_file.name}: {e}")
 
-                # ── 6. Re-zipper ─────────────────────────────────────
-                tmp_out = str(xlsm_path) + '.tmp'
-                with zipfile.ZipFile(tmp_out, 'w',
-                                     zipfile.ZIP_DEFLATED) as zout:
-                    for fp in tp.rglob('*'):
-                        if fp.is_file():
-                            zout.write(fp, fp.relative_to(tp))
-                shutil.move(tmp_out, str(xlsm_path))
-                self.log(f"    ✅ XLSM nettoyé (VBA préservé)")
+            # ── 4. Nettoyer les sheet rels (embeddings + vmlDrawing) ──
+            rels_dir = ws_dir / '_rels' if ws_dir.exists() else None
+            if rels_dir and rels_dir.exists():
+                for rels_file in rels_dir.glob('sheet*.xml.rels'):
+                    try:
+                        tree = _et.parse(str(rels_file))
+                        root = tree.getroot()
+                        changed = False
+                        for rel in list(
+                                root.findall(
+                                    f'{{{ns_rel}}}Relationship')):
+                            tgt = rel.get('Target', '')
+                            tlow = tgt.lower()
+                            if ('embeddings/' in tlow
+                                    or 'vmldrawing' in tlow):
+                                if 'vmldrawing' in tlow:
+                                    if tgt.startswith('../'):
+                                        vp = tp / 'xl' / tgt[3:]
+                                    elif tgt.startswith('/'):
+                                        vp = tp / tgt.lstrip('/')
+                                    else:
+                                        vp = ws_dir / tgt
+                                    vml_files_to_delete.add(vp.resolve())
+                                root.remove(rel)
+                                changed = True
+                        if changed:
+                            tree.write(str(rels_file),
+                                       encoding='UTF-8',
+                                       xml_declaration=True)
+                    except Exception as e:
+                        self.log(f"    ⚠️ {rels_file.name}: {e}")
 
+            # ── 5. Supprimer les embeddings physiques ─────────────────
+            emb_dir = tp / 'xl' / 'embeddings'
+            if emb_dir.exists():
+                for fn in filename_to_position.keys():
+                    fp = emb_dir / fn
+                    if fp.exists():
+                        fp.unlink()
+                        deleted_parts.append('/xl/embeddings/' + fn)
+                        self.log(f"    🗑️ {fn} supprimé")
+
+            # ── 6. Supprimer les VML d'icônes + leurs images ──────────
+            for vp in vml_files_to_delete:
+                try:
+                    if vp.exists():
+                        vml_rels = (vp.parent / '_rels'
+                                    / (vp.name + '.rels'))
+                        if vml_rels.exists():
+                            try:
+                                tt = _et.parse(str(vml_rels))
+                                for rr in tt.getroot().findall(
+                                        f'{{{ns_rel}}}Relationship'):
+                                    t = rr.get('Target', '')
+                                    if t.startswith('../'):
+                                        ip = tp / 'xl' / t[3:]
+                                    else:
+                                        ip = vp.parent / t
+                                    ip = ip.resolve()
+                                    if (ip.exists()
+                                            and 'media' in str(ip)):
+                                        ip.unlink()
+                                        deleted_parts.append(
+                                            '/' + str(
+                                                ip.relative_to(tp)
+                                            ).replace('\\', '/'))
+                            except Exception:
+                                pass
+                            vml_rels.unlink()
+                        vp.unlink()
+                        deleted_parts.append(
+                            '/' + str(
+                                vp.relative_to(tp)
+                            ).replace('\\', '/'))
+                        self.log(f"    🗑️ {vp.name} supprimé")
+                except Exception as e:
+                    self.log(f"    ⚠️ VML {vp}: {e}")
+
+            # ── 7. Mettre à jour [Content_Types].xml ──────────────────
+            ct_path = tp / '[Content_Types].xml'
+            if ct_path.exists() and deleted_parts:
+                try:
+                    tree = _et.parse(str(ct_path))
+                    root = tree.getroot()
+                    removed = 0
+                    for ov in list(
+                            root.findall(f'{{{ns_ct}}}Override')):
+                        if ov.get('PartName', '') in deleted_parts:
+                            root.remove(ov)
+                            removed += 1
+                    if removed:
+                        tree.write(str(ct_path),
+                                   encoding='UTF-8',
+                                   xml_declaration=True)
+                        self.log(f"    🧹 {removed} Override(s) retirés")
+                except Exception as e:
+                    self.log(f"    ⚠️ Content-Types: {e}")
+
+            # ── 8. Re-zipper ──────────────────────────────────────────
+            with zipfile.ZipFile(modified_path, 'w',
+                                 zipfile.ZIP_DEFLATED) as zout:
+                for fp in tp.rglob('*'):
+                    if fp.is_file():
+                        zout.write(fp, fp.relative_to(tp))
+
+        return modifications_applied
+
+    def _add_red_bold_style(self, styles_path, ns_main):
+        """
+        Ajoute une police rouge gras 12pt + un cellXfs à styles.xml.
+        Retourne l'index du cellXfs (à utiliser comme attribut s="N").
+        Renvoie None si styles.xml introuvable.
+        """
+        from lxml import etree as _et
+        if not styles_path.exists():
+            return None
+        try:
+            tree = _et.parse(str(styles_path))
+            root = tree.getroot()
+            ns = f'{{{ns_main}}}'
+
+            fonts = root.find(f'{ns}fonts')
+            cellXfs = root.find(f'{ns}cellXfs')
+            if fonts is None or cellXfs is None:
+                return None
+
+            # Ajouter <font>
+            font = _et.SubElement(fonts, f'{ns}font')
+            b = _et.SubElement(font, f'{ns}b')
+            sz = _et.SubElement(font, f'{ns}sz')
+            sz.set('val', '12')
+            color = _et.SubElement(font, f'{ns}color')
+            color.set('rgb', 'FFFF0000')
+            name = _et.SubElement(font, f'{ns}name')
+            name.set('val', 'Calibri')
+            font_id = len(fonts.findall(f'{ns}font')) - 1
+            try:
+                fonts.set('count', str(int(fonts.get('count', '0')) + 1))
+            except ValueError:
+                fonts.set('count', str(font_id + 1))
+
+            # Ajouter <xf> dans cellXfs
+            xf = _et.SubElement(cellXfs, f'{ns}xf')
+            xf.set('numFmtId', '0')
+            xf.set('fontId', str(font_id))
+            xf.set('fillId', '0')
+            xf.set('borderId', '0')
+            xf.set('xfId', '0')
+            xf.set('applyFont', '1')
+            style_id = len(cellXfs.findall(f'{ns}xf')) - 1
+            try:
+                cellXfs.set('count',
+                            str(int(cellXfs.get('count', '0')) + 1))
+            except ValueError:
+                cellXfs.set('count', str(style_id + 1))
+
+            tree.write(str(styles_path),
+                       encoding='UTF-8', xml_declaration=True)
+            return style_id
         except Exception as e:
-            self.log(f"  ⚠️ _strip_xlsm_ole_residue: {e}")
+            self.log(f"    ⚠️ styles.xml: {e}")
+            return None
+
+    def _set_inline_string(self, ws_root, ns_m, col, row, text, style_id):
+        """
+        Écrit `text` comme inline string dans la cellule (col, row) du
+        worksheet XML. Crée la row et la cell si nécessaire, en respectant
+        l'ordre par r="N". Retourne True si écrit.
+        """
+        from lxml import etree as _et
+
+        sheet_data = ws_root.find(f'{ns_m}sheetData')
+        if sheet_data is None:
+            return False
+
+        cell_ref = f'{self._col_letter(col)}{row}'
+
+        # Trouver ou créer la row
+        target_row = None
+        for r in sheet_data.findall(f'{ns_m}row'):
+            try:
+                if int(r.get('r', '0')) == row:
+                    target_row = r
+                    break
+            except ValueError:
+                continue
+        if target_row is None:
+            target_row = _et.SubElement(sheet_data, f'{ns_m}row')
+            target_row.set('r', str(row))
+
+        # Trouver ou créer la cellule
+        target_cell = None
+        for c in target_row.findall(f'{ns_m}c'):
+            if c.get('r') == cell_ref:
+                target_cell = c
+                break
+        if target_cell is None:
+            target_cell = _et.SubElement(target_row, f'{ns_m}c')
+            target_cell.set('r', cell_ref)
+
+        # Vider et écrire inline string
+        for child in list(target_cell):
+            target_cell.remove(child)
+        target_cell.set('t', 'inlineStr')
+        if style_id is not None:
+            target_cell.set('s', str(style_id))
+        elif 's' in target_cell.attrib:
+            del target_cell.attrib['s']
+
+        is_el = _et.SubElement(target_cell, f'{ns_m}is')
+        t_el = _et.SubElement(is_el, f'{ns_m}t')
+        t_el.text = text
+        return True
 
     def create_modified_pptx_exact_positions(self, original_path, output_dir, extracted_files, temp_path):
             """
