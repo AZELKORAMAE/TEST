@@ -5502,6 +5502,16 @@ class EmbeddedFileExtractor:
             # ============================================================
             wb.save(str(modified_path))
 
+            # ============================================================
+            # ÉTAPE 5 : XLSM uniquement — nettoyer les résidus OLE
+            # ============================================================
+            # En mode keep_vba=True, openpyxl conserve l'archive d'origine
+            # comme base et préserve toutes les parts "inconnues" (embeddings,
+            # VML d'icônes, ancres de drawing). On les retire en post-traitement.
+            if original_ext == '.xlsm':
+                embed_names = list(filename_to_position.keys())
+                self._strip_xlsm_ole_residue(modified_path, embed_names)
+
             self.log(f"\n  ✅ Excel modifié : {modified_path.name}")
             self.log(f"  ✅ {modifications_applied} objet(s) OLE remplacé(s) par texte")
 
@@ -5515,6 +5525,191 @@ class EmbeddedFileExtractor:
                 self.log(f"  ⚠️ Copie de l'original créée")
             except Exception:
                 pass
+
+    def _strip_xlsm_ole_residue(self, xlsm_path, embed_filenames):
+        """
+        Post-traitement XLSM : retire les vestiges OLE qu'openpyxl conserve
+        en mode keep_vba (embeddings, VML d'icônes, ancres oleObject, rels).
+        Préserve vbaProject.bin et tout le reste.
+        """
+        try:
+            from lxml import etree as _et
+
+            xlsm_path = Path(xlsm_path)
+            ns_rel = ('http://schemas.openxmlformats.org'
+                      '/package/2006/relationships')
+            ns_r = ('http://schemas.openxmlformats.org'
+                    '/officeDocument/2006/relationships')
+            ns_ct = ('http://schemas.openxmlformats.org'
+                     '/package/2006/content-types')
+
+            with tempfile.TemporaryDirectory() as td:
+                tp = Path(td)
+                with zipfile.ZipFile(xlsm_path, 'r') as zf:
+                    zf.extractall(tp)
+
+                deleted_parts = []   # PartName absolus pour Content_Types
+
+                # ── 1. Worksheets : retirer oleObjects + legacyDrawing ──
+                ws_dir = tp / 'xl' / 'worksheets'
+                if ws_dir.exists():
+                    for ws_file in ws_dir.glob('sheet*.xml'):
+                        try:
+                            tree = _et.parse(str(ws_file))
+                            root = tree.getroot()
+                            changed = False
+
+                            # Parcourir et supprimer <oleObjects>,
+                            # <legacyDrawing>, et tout <mc:AlternateContent>
+                            # contenant un oleObject.
+                            for parent in list(root.iter()):
+                                for child in list(parent):
+                                    local = (child.tag.split('}')[-1]
+                                             if '}' in child.tag
+                                             else child.tag)
+                                    if local in ('oleObjects',
+                                                 'legacyDrawing'):
+                                        parent.remove(child)
+                                        changed = True
+                                    elif local == 'AlternateContent':
+                                        if any(
+                                            (d.tag.split('}')[-1]
+                                             if '}' in d.tag else d.tag)
+                                            == 'oleObject'
+                                            for d in child.iter()
+                                        ):
+                                            parent.remove(child)
+                                            changed = True
+
+                            if changed:
+                                tree.write(str(ws_file),
+                                           encoding='UTF-8',
+                                           xml_declaration=True)
+                                self.log(f"    🧹 OLE retiré de "
+                                         f"{ws_file.name}")
+                        except Exception as e:
+                            self.log(f"    ⚠️ {ws_file.name}: {e}")
+
+                # ── 2. Sheet rels : retirer embeddings + vmlDrawing rels ──
+                rels_dir = ws_dir / '_rels' if ws_dir.exists() else None
+                vml_files_to_delete = set()
+                if rels_dir and rels_dir.exists():
+                    for rels_file in rels_dir.glob('sheet*.xml.rels'):
+                        try:
+                            tree = _et.parse(str(rels_file))
+                            root = tree.getroot()
+                            changed = False
+                            for rel in list(
+                                    root.findall(
+                                        f'{{{ns_rel}}}Relationship')):
+                                tgt = rel.get('Target', '')
+                                if ('embeddings/' in tgt
+                                        or 'vmlDrawing' in tgt.lower()):
+                                    if 'vmlDrawing' in tgt.lower():
+                                        # Résoudre le path VML
+                                        if tgt.startswith('../'):
+                                            vp = tp / 'xl' / tgt[3:]
+                                        elif tgt.startswith('/'):
+                                            vp = tp / tgt.lstrip('/')
+                                        else:
+                                            vp = ws_dir / tgt
+                                        vml_files_to_delete.add(
+                                            vp.resolve())
+                                    root.remove(rel)
+                                    changed = True
+                            if changed:
+                                tree.write(str(rels_file),
+                                           encoding='UTF-8',
+                                           xml_declaration=True)
+                        except Exception as e:
+                            self.log(f"    ⚠️ {rels_file.name}: {e}")
+
+                # ── 3. Supprimer les embeddings physiques ──
+                emb_dir = tp / 'xl' / 'embeddings'
+                if emb_dir.exists():
+                    for fn in embed_filenames:
+                        fp = emb_dir / fn
+                        if fp.exists():
+                            fp.unlink()
+                            deleted_parts.append('/xl/embeddings/' + fn)
+                            self.log(f"    🗑️ {fn} supprimé")
+                    # Supprimer tous les embeddings restants n'étant plus
+                    # référencés ? Non — on garde au cas où d'autres feuilles
+                    # les utilisent et que la position n'a pas été trouvée.
+
+                # ── 4. Supprimer les fichiers VML orphelins ──
+                for vp in vml_files_to_delete:
+                    try:
+                        if vp.exists():
+                            vp.unlink()
+                            rel = '/' + str(
+                                vp.relative_to(tp)
+                            ).replace('\\', '/')
+                            deleted_parts.append(rel)
+                            self.log(f"    🗑️ {vp.name} supprimé")
+                            # Supprimer le .rels associé (vml peut avoir
+                            # ses propres rels pour les images d'icônes)
+                            vml_rels = (vp.parent / '_rels'
+                                        / (vp.name + '.rels'))
+                            if vml_rels.exists():
+                                # Lire pour récupérer les images d'icônes
+                                try:
+                                    tt = _et.parse(str(vml_rels))
+                                    for rr in tt.getroot().findall(
+                                            f'{{{ns_rel}}}Relationship'):
+                                        t = rr.get('Target', '')
+                                        if t.startswith('../'):
+                                            ip = tp / 'xl' / t[3:]
+                                        else:
+                                            ip = vp.parent / t
+                                        ip = ip.resolve()
+                                        if ip.exists() and 'media' in str(ip):
+                                            ip.unlink()
+                                            rel2 = '/' + str(
+                                                ip.relative_to(tp)
+                                            ).replace('\\', '/')
+                                            deleted_parts.append(rel2)
+                                except Exception:
+                                    pass
+                                vml_rels.unlink()
+                    except Exception as e:
+                        self.log(f"    ⚠️ VML {vp}: {e}")
+
+                # ── 5. [Content_Types].xml : retirer les Override morts ──
+                ct_path = tp / '[Content_Types].xml'
+                if ct_path.exists() and deleted_parts:
+                    try:
+                        tree = _et.parse(str(ct_path))
+                        root = tree.getroot()
+                        removed = 0
+                        for ov in list(
+                                root.findall(f'{{{ns_ct}}}Override')):
+                            pn = ov.get('PartName', '')
+                            if pn in deleted_parts:
+                                root.remove(ov)
+                                removed += 1
+                        if removed:
+                            tree.write(str(ct_path),
+                                       encoding='UTF-8',
+                                       xml_declaration=True)
+                            self.log(f"    🧹 {removed} entrée(s) "
+                                     f"Content-Types retirée(s)")
+                    except Exception as e:
+                        self.log(f"    ⚠️ Content-Types: {e}")
+
+                # ── 6. Re-zipper ─────────────────────────────────────
+                tmp_out = str(xlsm_path) + '.tmp'
+                with zipfile.ZipFile(tmp_out, 'w',
+                                     zipfile.ZIP_DEFLATED) as zout:
+                    for fp in tp.rglob('*'):
+                        if fp.is_file():
+                            zout.write(fp, fp.relative_to(tp))
+                shutil.move(tmp_out, str(xlsm_path))
+                self.log(f"    ✅ XLSM nettoyé (VBA préservé)")
+
+        except Exception as e:
+            self.log(f"  ⚠️ _strip_xlsm_ole_residue: {e}")
+
     def create_modified_pptx_exact_positions(self, original_path, output_dir, extracted_files, temp_path):
             """
             Crée PowerPoint modifié en CONSERVANT LES POSITIONS EXACTES.
