@@ -5308,9 +5308,12 @@ class EmbeddedFileExtractor:
                 pass
     def create_modified_xlsx_exact_positions(self, original_path, output_dir, extracted_files):
         """
-        Crée Excel modifié :
-        - Supprime les objets OLE extraits du worksheet XML et drawing XML
-        - Insère "Voir [nom_fichier]" en rouge dans la cellule correspondante
+        Crée Excel modifié - MÊME LOGIQUE QUE DOCX/PPTX :
+        1. Découvre les positions des objets OLE depuis le XML (lecture seule)
+        2. Ouvre le fichier avec openpyxl
+        3. Supprime les objets OLE via l'API openpyxl (_oleObjects, legacy_drawing)
+        4. Insère "Voir [filename]" en rouge à la position d'origine
+        5. Sauvegarde via openpyxl → fichier valide, pas d'erreur d'ouverture
         """
         try:
             from lxml import etree as _et
@@ -5322,265 +5325,185 @@ class EmbeddedFileExtractor:
             ns_xdr = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
             ns_r   = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
+            # ============================================================
+            # ÉTAPE 1 : DÉCOUVRIR LES POSITIONS OLE (lecture seule du XML)
+            # ============================================================
+            self.log(f"\n  🔍 DÉCOUVERTE DES POSITIONS OLE...")
 
-                # ── 1. Extraire le XLSX ──────────────────────────────────
-                with zipfile.ZipFile(original_path, 'r') as zf:
-                    zf.extractall(temp_path)
+            # filename_to_position[embed_filename] = (sheet_index_1based, col_1, row_1)
+            filename_to_position = {}
 
-                # ── 2. Grouper les items 'replace' par sheet_number ──────
-                sheets_actions = {}
-                for item in extracted_files:
-                    if item['action'] != 'replace':
-                        continue
-                    sheet_num = item.get('location', {}).get('sheet_number')
-                    if sheet_num is None:
-                        continue
-                    sheets_actions.setdefault(sheet_num, []).append(item)
+            with zipfile.ZipFile(original_path, 'r') as zf:
+                namelist = zf.namelist()
+                sheet_files = sorted(
+                    [n for n in namelist
+                     if n.startswith('xl/worksheets/sheet')
+                     and n.endswith('.xml')]
+                )
 
-                # ── 3. Pour chaque feuille : supprimer shapes OLE ────────
-                cells_to_fill = []  # (sheet_name, col, row, text)
-
-                for sheet_num, items in sheets_actions.items():
-                    ws_path = (temp_path / 'xl' / 'worksheets'
-                               / f'sheet{sheet_num}.xml')
-                    ws_rels_path = (temp_path / 'xl' / 'worksheets' / '_rels'
-                                    / f'sheet{sheet_num}.xml.rels')
-
-                    if not ws_path.exists() or not ws_rels_path.exists():
-                        self.log(f"    ⚠️ sheet{sheet_num}.xml ou rels introuvable")
+                for ws_name in sheet_files:
+                    stem = Path(ws_name).stem  # 'sheet1'
+                    try:
+                        sheet_idx = int(stem.replace('sheet', ''))
+                    except ValueError:
                         continue
 
-                    # ── 3a. Sheet rels → embed_filename → rel_id ─────────
-                    # Les embeddings OLE sont référencés dans les sheet rels,
-                    # PAS dans les drawing rels.
-                    ws_rels_tree = _et.parse(str(ws_rels_path))
-                    ws_rels_root = ws_rels_tree.getroot()
+                    rels_name = f'xl/worksheets/_rels/{stem}.xml.rels'
+                    if rels_name not in namelist:
+                        continue
 
-                    embed_to_relid = {}   # 'oleObject1.bin' → 'rId5'
-                    relid_to_embed = {}   # 'rId5' → 'oleObject1.bin'
-                    for rel in ws_rels_root.findall(f'{{{ns_rel}}}Relationship'):
-                        tgt = rel.get('Target', '')
-                        if 'embeddings/' in tgt:
-                            basename = Path(tgt).name
-                            rid = rel.get('Id')
-                            embed_to_relid[basename] = rid
-                            relid_to_embed[rid] = basename
-
-                    items_by_embed = {item['filename']: item for item in items}
-                    rel_ids_to_remove = {
-                        embed_to_relid[fn]
-                        for fn in items_by_embed
-                        if fn in embed_to_relid
+                    rels_root = _et.fromstring(zf.read(rels_name))
+                    relid_to_target = {
+                        rel.get('Id'): rel.get('Target', '')
+                        for rel in rels_root.findall(f'{{{ns_rel}}}Relationship')
                     }
 
-                    if not rel_ids_to_remove:
-                        self.log(f"    ⚠️ Aucune relation embedding dans sheet rels "
-                                 f"pour feuille {sheet_num} "
-                                 f"(cherché: {list(items_by_embed.keys())}, "
-                                 f"trouvé: {list(embed_to_relid.keys())})")
+                    # Worksheet XML : oleObject → (shape_id, embed_basename)
+                    ws_root = _et.fromstring(zf.read(ws_name))
+                    shapeid_to_embed = {}
+                    for elem in ws_root.iter():
+                        tag = (elem.tag.split('}')[-1]
+                               if '}' in elem.tag else elem.tag)
+                        if tag != 'oleObject':
+                            continue
+                        rid = elem.get(f'{{{ns_r}}}id')
+                        sid = elem.get('shapeId')
+                        if rid and sid and rid in relid_to_target:
+                            embed_name = Path(relid_to_target[rid]).name
+                            try:
+                                shapeid_to_embed[int(sid)] = embed_name
+                            except ValueError:
+                                pass
+
+                    if not shapeid_to_embed:
                         continue
 
-                    # ── 3b. Worksheet XML → <oleObject r:id shapeId> ──────
-                    ws_tree = _et.parse(str(ws_path))
-                    ws_root = ws_tree.getroot()
+                    # Résoudre le drawing pour la feuille
+                    drawing_target = next(
+                        (t for t in relid_to_target.values()
+                         if 'drawing' in t.lower() and t.endswith('.xml')),
+                        None
+                    )
+                    if not drawing_target:
+                        continue
 
-                    relid_to_shapeid = {}     # 'rId5' → 1025
-                    extra_relids_to_remove = set()  # image rels dans objectPr
+                    # Normaliser path drawing
+                    if drawing_target.startswith('/'):
+                        drawing_path = drawing_target.lstrip('/')
+                    else:
+                        base = 'xl/worksheets/'
+                        joined = base + drawing_target
+                        parts = []
+                        for p in joined.replace('\\', '/').split('/'):
+                            if p == '..':
+                                if parts: parts.pop()
+                            elif p and p != '.':
+                                parts.append(p)
+                        drawing_path = '/'.join(parts)
 
-                    for elem in ws_root.iter():
-                        local = (elem.tag.split('}')[-1]
-                                 if '}' in elem.tag else elem.tag)
-                        if local != 'oleObjects':
+                    if drawing_path not in namelist:
+                        continue
+
+                    drawing_root = _et.fromstring(zf.read(drawing_path))
+                    for anchor in drawing_root.iter():
+                        atag = (anchor.tag.split('}')[-1]
+                                if '}' in anchor.tag else anchor.tag)
+                        if atag not in ('twoCellAnchor', 'oneCellAnchor',
+                                        'absoluteAnchor'):
                             continue
-                        for ole_obj in list(elem):
-                            ol = (ole_obj.tag.split('}')[-1]
-                                  if '}' in ole_obj.tag else ole_obj.tag)
-                            if ol != 'oleObject':
-                                continue
-                            r_id = ole_obj.get(f'{{{ns_r}}}id')
-                            shape_id = ole_obj.get('shapeId')
-                            if r_id in rel_ids_to_remove and shape_id:
-                                relid_to_shapeid[r_id] = int(shape_id)
-                                # Collecter les rel d'image (objectPr)
-                                for child in ole_obj.iter():
-                                    cl = (child.tag.split('}')[-1]
-                                          if '}' in child.tag else child.tag)
-                                    if cl == 'objectPr':
-                                        pr_rid = child.get(f'{{{ns_r}}}id')
-                                        if pr_rid:
-                                            extra_relids_to_remove.add(pr_rid)
-                                elem.remove(ole_obj)
-                                self.log(f"    🗑️ <oleObject r:id={r_id} "
-                                         f"shapeId={shape_id}> supprimé du XML")
-                        # Supprimer <oleObjects> si vide
-                        if len(elem) == 0:
-                            parent = elem.getparent()
-                            if parent is not None:
-                                parent.remove(elem)
+                        shape_id_found = None
+                        for cnv in anchor.iter():
+                            ctag = (cnv.tag.split('}')[-1]
+                                    if '}' in cnv.tag else cnv.tag)
+                            if ctag == 'cNvPr':
+                                sid = cnv.get('id')
+                                try:
+                                    if sid and int(sid) in shapeid_to_embed:
+                                        shape_id_found = int(sid)
+                                        break
+                                except ValueError:
+                                    pass
+                        if shape_id_found is None:
+                            continue
 
-                    ws_tree.write(str(ws_path),
-                                  encoding='UTF-8', xml_declaration=True)
+                        col, row = 1, 1
+                        from_e = anchor.find(f'{{{ns_xdr}}}from')
+                        if from_e is not None:
+                            c = from_e.find(f'{{{ns_xdr}}}col')
+                            r = from_e.find(f'{{{ns_xdr}}}row')
+                            if c is not None and c.text:
+                                col = int(c.text) + 1
+                            if r is not None and r.text:
+                                row = int(r.text) + 1
 
-                    shape_ids_to_remove = set(relid_to_shapeid.values())
-                    self.log(f"    📐 shapeIds à supprimer: {shape_ids_to_remove}")
+                        embed_name = shapeid_to_embed[shape_id_found]
+                        filename_to_position[embed_name] = (sheet_idx, col, row)
+                        self.log(f"    📍 {embed_name} → sheet{sheet_idx} "
+                                 f"col={col} row={row}")
 
-                    # ── 3c. Drawing XML → supprimer anchors par shapeId ───
-                    drawing_path = None
-                    for rel in ws_rels_root.findall(f'{{{ns_rel}}}Relationship'):
-                        target = rel.get('Target', '')
-                        if 'drawing' in target.lower():
-                            if target.startswith('../'):
-                                drawing_path = temp_path / 'xl' / target[3:]
-                            else:
-                                drawing_path = (temp_path / 'xl'
-                                                / 'worksheets' / target)
-                            if not drawing_path.exists():
-                                drawing_path = (temp_path / 'xl' / 'drawings'
-                                                / Path(target).name)
-                            break
+            self.log(f"  ✅ {len(filename_to_position)} position(s) OLE découverte(s)")
 
-                    if drawing_path and drawing_path.exists() and shape_ids_to_remove:
-                        drawing_tree = _et.parse(str(drawing_path))
-                        drawing_root = drawing_tree.getroot()
+            # ============================================================
+            # ÉTAPE 2 : OUVRIR AVEC OPENPYXL ET SUPPRIMER LES OLE
+            # ============================================================
+            original_ext = original_path.suffix.lower()
+            wb = openpyxl.load_workbook(
+                str(original_path),
+                keep_vba=(original_ext == '.xlsm')
+            )
 
-                        for anchor_tag in [f'{{{ns_xdr}}}twoCellAnchor',
-                                           f'{{{ns_xdr}}}oneCellAnchor',
-                                           f'{{{ns_xdr}}}absoluteAnchor']:
-                            for anchor in list(drawing_root.findall(anchor_tag)):
-                                # Chercher un cNvPr dont id ∈ shape_ids_to_remove
-                                shape_id_found = None
-                                for cnv_pr in anchor.iter():
-                                    tlocal = (cnv_pr.tag.split('}')[-1]
-                                              if '}' in cnv_pr.tag else cnv_pr.tag)
-                                    if tlocal == 'cNvPr':
-                                        sp_id = cnv_pr.get('id')
-                                        if sp_id and int(sp_id) in shape_ids_to_remove:
-                                            shape_id_found = int(sp_id)
-                                            break
+            # Supprimer les objets OLE et le legacy drawing (icônes VML)
+            # de TOUTES les feuilles - openpyxl écrira un fichier propre.
+            for ws in wb.worksheets:
+                if hasattr(ws, '_oleObjects'):
+                    try:
+                        ws._oleObjects = []
+                    except Exception:
+                        pass
+                if hasattr(ws, 'legacy_drawing'):
+                    try:
+                        ws.legacy_drawing = None
+                    except Exception:
+                        pass
 
-                                if shape_id_found is None:
-                                    continue
+            # ============================================================
+            # ÉTAPE 3 : INSÉRER "Voir [filename]" AUX POSITIONS DÉCOUVERTES
+            # ============================================================
+            self.log(f"\n  🔧 INSERTION DES TEXTES DE REMPLACEMENT...")
+            modifications_applied = 0
 
-                                # Position cellule depuis <xdr:from>
-                                col, row = 1, 1
-                                from_elem = anchor.find(f'{{{ns_xdr}}}from')
-                                if from_elem is not None:
-                                    col_e = from_elem.find(f'{{{ns_xdr}}}col')
-                                    row_e = from_elem.find(f'{{{ns_xdr}}}row')
-                                    if col_e is not None:
-                                        col = int(col_e.text) + 1
-                                    if row_e is not None:
-                                        row = int(row_e.text) + 1
+            for item in extracted_files:
+                if item['action'] != 'replace':
+                    continue
+                filename = item.get('filename')
+                extracted_name = item.get('extracted_name', '')
+                if not filename:
+                    continue
+                if filename not in filename_to_position:
+                    self.log(f"    ⚠️ Position introuvable : {filename}")
+                    continue
 
-                                # Retrouver l'item correspondant à ce shapeId
-                                for r_id, sid in relid_to_shapeid.items():
-                                    if sid != shape_id_found:
-                                        continue
-                                    embed_name = relid_to_embed.get(r_id, '')
-                                    if embed_name not in items_by_embed:
-                                        continue
-                                    ext_name = items_by_embed[embed_name].get(
-                                        'extracted_name', '')
-                                    if ext_name:
-                                        sname = (items_by_embed[embed_name]
-                                                 .get('location', {})
-                                                 .get('sheet_name',
-                                                      f'Feuille{sheet_num}'))
-                                        cells_to_fill.append(
-                                            (sname, col, row,
-                                             f"Voir {Path(ext_name).stem}"))
-                                        self.log(f"    📍 {sname} col={col} "
-                                                 f"row={row} → "
-                                                 f"Voir {Path(ext_name).stem}")
+                sheet_idx, col, row = filename_to_position[filename]
+                if sheet_idx < 1 or sheet_idx > len(wb.worksheets):
+                    self.log(f"    ⚠️ Index de feuille invalide pour {filename}")
+                    continue
 
-                                drawing_root.remove(anchor)
-                                self.log(f"    🗑️ Anchor supprimé du drawing "
-                                         f"(shapeId={shape_id_found})")
+                ws = wb.worksheets[sheet_idx - 1]
+                display = (Path(extracted_name).stem if extracted_name
+                           else Path(filename).stem)
+                cell = ws.cell(row=row, column=col)
+                cell.value = f"Voir {display}"
+                cell.font = Font(bold=True, color='FF0000', size=12)
+                self.log(f"    ✅ {ws.title}!{cell.coordinate} → Voir {display}")
+                modifications_applied += 1
 
-                        drawing_tree.write(str(drawing_path),
-                                           encoding='UTF-8', xml_declaration=True)
+            # ============================================================
+            # ÉTAPE 4 : SAUVEGARDER (openpyxl écrit un fichier valide)
+            # ============================================================
+            wb.save(str(modified_path))
 
-                    # ── 3d. Supprimer les rels embedding + image dans sheet ──
-                    all_to_remove = rel_ids_to_remove | extra_relids_to_remove
-                    for rel in list(ws_rels_root.findall(
-                            f'{{{ns_rel}}}Relationship')):
-                        if rel.get('Id') in all_to_remove:
-                            ws_rels_root.remove(rel)
-
-                    ws_rels_tree.write(str(ws_rels_path),
-                                       encoding='UTF-8', xml_declaration=True)
-                    self.log(f"    🗑️ {len(all_to_remove)} rel(s) supprimée(s) "
-                             f"du sheet rels")
-
-                # ── 4. Supprimer les fichiers embedding ──────────────────
-                embeddings_dir = temp_path / 'xl' / 'embeddings'
-                deleted_part_names = []   # pour mise à jour [Content_Types].xml
-                for item in extracted_files:
-                    if item['action'] == 'replace' and item.get('filename'):
-                        ep = embeddings_dir / item['filename']
-                        if ep.exists():
-                            ep.unlink()
-                            deleted_part_names.append(
-                                '/xl/embeddings/' + item['filename'])
-                            self.log(f"    🗑️ Embedding supprimé: {item['filename']}")
-
-                # ── 4b. Mettre à jour [Content_Types].xml ────────────────
-                # CRITIQUE : si les Override pour les fichiers supprimés restent
-                # dans [Content_Types].xml, Excel affiche "Nous avons trouvé un
-                # problème dans le contenu du fichier" au premier ouverture.
-                if deleted_part_names:
-                    ct_path = temp_path / '[Content_Types].xml'
-                    if ct_path.exists():
-                        try:
-                            _ct_ns = ('http://schemas.openxmlformats.org'
-                                      '/package/2006/content-types')
-                            ct_tree = _et.parse(str(ct_path))
-                            ct_root = ct_tree.getroot()
-                            removed_ct = 0
-                            for override in list(
-                                    ct_root.findall(f'{{{_ct_ns}}}Override')):
-                                if override.get('PartName') in deleted_part_names:
-                                    ct_root.remove(override)
-                                    removed_ct += 1
-                                    self.log(f"    🗑️ ContentType retiré: "
-                                             f"{override.get('PartName')}")
-                            if removed_ct:
-                                ct_tree.write(
-                                    str(ct_path),
-                                    encoding='UTF-8',
-                                    xml_declaration=True)
-                                self.log(f"    ✅ [Content_Types].xml mis à jour "
-                                         f"({removed_ct} entrée(s) supprimée(s))")
-                        except Exception as ct_err:
-                            self.log(f"    ⚠️ Erreur Content-Types: {ct_err}")
-
-                # ── 5. Repackager en XLSX ────────────────────────────────
-                with zipfile.ZipFile(modified_path, 'w', zipfile.ZIP_DEFLATED) as zout:
-                    for fp in temp_path.rglob('*'):
-                        if fp.is_file():
-                            zout.write(fp, fp.relative_to(temp_path))
-
-            # ── 6. Ajouter texte "Voir ..." via openpyxl ─────────────────
-            if cells_to_fill:
-                original_ext = original_path.suffix
-                wb = openpyxl.load_workbook(str(modified_path),
-                                            keep_vba=(original_ext == '.xlsm'))
-                for sheet_name, col, row, text in cells_to_fill:
-                    ws = (wb[sheet_name] if sheet_name in wb.sheetnames
-                          else wb.active)
-                    if ws is not None:
-                        cell = ws.cell(row=row, column=col)
-                        cell.value = text
-                        cell.font = Font(bold=True, color='FF0000', size=12)
-                        self.log(f"    ✅ Texte inséré: '{text}' → "
-                                 f"{ws.title}!{cell.coordinate}")
-                wb.save(str(modified_path))
-
-            nb_replaced = sum(1 for i in extracted_files if i['action'] == 'replace')
             self.log(f"\n  ✅ Excel modifié : {modified_path.name}")
-            self.log(f"  ✅ {nb_replaced} objet(s) OLE supprimé(s) et remplacé(s) par texte")
+            self.log(f"  ✅ {modifications_applied} objet(s) OLE remplacé(s) par texte")
 
         except Exception as e:
             self.log(f"  ❌ Erreur: {str(e)}")
