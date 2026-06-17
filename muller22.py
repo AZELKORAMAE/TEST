@@ -5516,12 +5516,45 @@ class EmbeddedFileExtractor:
 
                 # ── 4. Supprimer les fichiers embedding ──────────────────
                 embeddings_dir = temp_path / 'xl' / 'embeddings'
+                deleted_part_names = []   # pour mise à jour [Content_Types].xml
                 for item in extracted_files:
                     if item['action'] == 'replace' and item.get('filename'):
                         ep = embeddings_dir / item['filename']
                         if ep.exists():
                             ep.unlink()
+                            deleted_part_names.append(
+                                '/xl/embeddings/' + item['filename'])
                             self.log(f"    🗑️ Embedding supprimé: {item['filename']}")
+
+                # ── 4b. Mettre à jour [Content_Types].xml ────────────────
+                # CRITIQUE : si les Override pour les fichiers supprimés restent
+                # dans [Content_Types].xml, Excel affiche "Nous avons trouvé un
+                # problème dans le contenu du fichier" au premier ouverture.
+                if deleted_part_names:
+                    ct_path = temp_path / '[Content_Types].xml'
+                    if ct_path.exists():
+                        try:
+                            _ct_ns = ('http://schemas.openxmlformats.org'
+                                      '/package/2006/content-types')
+                            ct_tree = _et.parse(str(ct_path))
+                            ct_root = ct_tree.getroot()
+                            removed_ct = 0
+                            for override in list(
+                                    ct_root.findall(f'{{{_ct_ns}}}Override')):
+                                if override.get('PartName') in deleted_part_names:
+                                    ct_root.remove(override)
+                                    removed_ct += 1
+                                    self.log(f"    🗑️ ContentType retiré: "
+                                             f"{override.get('PartName')}")
+                            if removed_ct:
+                                ct_tree.write(
+                                    str(ct_path),
+                                    encoding='UTF-8',
+                                    xml_declaration=True)
+                                self.log(f"    ✅ [Content_Types].xml mis à jour "
+                                         f"({removed_ct} entrée(s) supprimée(s))")
+                        except Exception as ct_err:
+                            self.log(f"    ⚠️ Erreur Content-Types: {ct_err}")
 
                 # ── 5. Repackager en XLSX ────────────────────────────────
                 with zipfile.ZipFile(modified_path, 'w', zipfile.ZIP_DEFLATED) as zout:
